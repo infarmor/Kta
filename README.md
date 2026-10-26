@@ -1,8 +1,12 @@
-<p align="center">
-  <img src="assets/katana.svg" width="160" alt="Kta katana icon">
-</p>
+<pre align="center">
+    __    __
+   / /__ / /_____ _
+  / //_// __/ __ `/
+ / ,&lt;  / /_/ /_/ /
+/_/|_| \__/\__,_/
 
-<h1 align="center">Kta</h1>
+iPhone traffic, cut by app
+</pre>
 
 <p align="center">
   Cut through your iPhone's traffic: see which app connects to which host.<br>
@@ -48,17 +52,7 @@ cd Kta
 ./kta analyze phone.pcapng --process Pinterest
 ```
 
-Баннер печатается в stderr. Отключить: `./kta -s run` (флаг `-s` ставится перед командой).
-
-```
-    __    __
-   / /__ / /_____ _
-  / //_// __/ __ `/
- / ,<  / /_/ /_/ /
-/_/|_| \__/\__,_/
-
-  iPhone traffic, cut by app          v0.1.0
-```
+ASCII-баннер печатается в stderr. Отключить: `./kta -s run` (флаг `-s` ставится перед командой).
 
 Пример вывода:
 
