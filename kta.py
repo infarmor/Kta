@@ -20,18 +20,17 @@ from datetime import datetime
 __version__ = "0.1.0"
 
 BANNER = r"""
- _  _______  _
-| |/ /_   _|/ \
-| ' /  | | / _ \
-| . \  | |/ ___ \
-|_|\_\ |_/_/   \_\
-"""
+    __   __
+   / /__/ /_____ _
+  / //_/ __/ __ `/
+ / ,< / /_/ /_/ /
+/_/|_|\__/\__,_/"""
 
 
 def print_banner():
-    red, dim, off = ("\033[31m", "\033[2m", "\033[0m") if sys.stderr.isatty() else ("", "", "")
-    print(f"{red}{BANNER}{off}", file=sys.stderr)
-    print(f"{dim}  iPhone traffic, cut by app          v{__version__}{off}\n", file=sys.stderr)
+    dim, off = ("\033[2m", "\033[0m") if sys.stderr.isatty() else ("", "")
+    print(f"{BANNER}   {dim}v{__version__}{off}\n", file=sys.stderr)
+    print(f"{dim}        iPhone traffic, cut by app{off}\n", file=sys.stderr)
 
 
 # ---------------------------------------------------------------- capture ---
