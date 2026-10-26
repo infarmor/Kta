@@ -17,6 +17,23 @@ import sys
 import threading
 from datetime import datetime
 
+__version__ = "0.1.0"
+
+BANNER = r"""
+    __    __
+   / /__ / /_____ _
+  / //_// __/ __ `/
+ / ,<  / /_/ /_/ /
+/_/|_| \__/\__,_/
+ (o)==[#]===========================---->
+"""
+
+
+def print_banner():
+    red, dim, off = ("\033[31m", "\033[2m", "\033[0m") if sys.stderr.isatty() else ("", "", "")
+    print(f"{red}{BANNER}{off}", file=sys.stderr)
+    print(f"{dim}  iPhone traffic, cut by app          v{__version__}{off}\n", file=sys.stderr)
+
 
 # ---------------------------------------------------------------- capture ---
 
@@ -194,6 +211,8 @@ def cmd_run(args):
 
 def main():
     ap = argparse.ArgumentParser(prog="kta", description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    ap.add_argument("-s", "--silent", action="store_true", help="do not print the banner")
+    ap.add_argument("--version", action="version", version=f"kta {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     c = sub.add_parser("capture", help="record iPhone traffic over USB")
@@ -215,6 +234,8 @@ def main():
     r.set_defaults(fn=cmd_run)
 
     args = ap.parse_args()
+    if not args.silent:
+        print_banner()
     args.fn(args)
 
 
