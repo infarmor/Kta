@@ -2,8 +2,8 @@
 """Kta: capture an iPhone's traffic on a Mac over USB and see which app talks to which host.
 
   kta capture --out iphone.pcapng [--process Name] [--seconds N]
-  kta analyze iphone.pcapng [--process Name] [--top N]
-  kta run [--seconds N] [--process Name]      capture, then analyze
+  kta analyze iphone.pcapng [--process Name] [--top N] [--json]
+  kta run [--seconds N] [--process Name] [--json]   capture, then analyze
 """
 import argparse
 import collections
@@ -11,6 +11,7 @@ import contextlib
 import functools
 import hashlib
 import hmac
+import json
 import os
 import re
 import signal
@@ -20,7 +21,9 @@ import sys
 import threading
 from datetime import datetime
 
+
 __version__ = "0.1.0"
+
 
 BANNER = r"""
     __   __
@@ -29,12 +32,15 @@ BANNER = r"""
  / ,< / /_/ /_/ /
 /_/|_|\__/\__,_/"""
 
+
 def print_banner():
     dim, off = ("\033[2m", "\033[0m") if sys.stderr.isatty() else ("", "")
     print(f"{BANNER}   {dim}v{__version__}{off}\n", file=sys.stderr)
     print(f"{dim}        iPhone traffic, cut by app{off}\n", file=sys.stderr)
 
+
 # ---------------------------------------------------------------- capture ---
+
 
 def _patch_pcapd():
     """Skip malformed service packets (newer iOS sends 1-byte frames that crash pymobiledevice3)."""
@@ -68,6 +74,7 @@ def _patch_pcapd():
             index += 1
 
     pcapd.PcapdService.watch = watch
+
 
 def cmd_capture(args):
     try:
@@ -104,7 +111,9 @@ def cmd_capture(args):
     print(f"[kta] saved {out} ({size / 1e6:.1f} MB)", file=sys.stderr)
     return out
 
+
 # ------------------------------------------------------------------ parse ---
+
 
 def _dns_name(m, i):
     out = []
@@ -114,6 +123,7 @@ def _dns_name(m, i):
         out.append(m[i + 1:i + 1 + m[i]].decode("ascii", "replace"))
         i += m[i] + 1
     return ".".join(out)
+
 
 def _tls_sni(p):
     try:
@@ -135,6 +145,7 @@ def _tls_sni(p):
         return None
     return None
 
+
 def _dns_skip_name(m, i):
     while True:
         n = m[i]
@@ -143,6 +154,7 @@ def _dns_skip_name(m, i):
         if n & 0xC0 == 0xC0:
             return i + 2
         i += n + 1
+
 
 def _dns_answers(m):
     """The question of a DNS response and the A/AAAA addresses in its answers (CNAME chains included)."""
@@ -166,15 +178,18 @@ def _dns_answers(m):
     except (IndexError, struct.error, OSError):
         return None, []
 
+
 # ------------------------------------------------------------------- quic ---
 # A QUIC client Initial is encrypted with keys derived from its destination connection ID and a salt published
 # in the RFC, so anyone on the path can read the TLS ClientHello inside it, and the server name with it.
 # RFC 9001 section 5 (v1) and RFC 9369 (v2).
 
+
 QUIC_VERSIONS = {  # version: (initial salt, label prefix, Initial type, Retry type)
     0x00000001: (bytes.fromhex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a"), "quic ", 0, 3),
     0x6B3343CF: (bytes.fromhex("0dede3def700a6db819381be6e269dcbf9bd2ed9"), "quicv2 ", 1, 0),
 }
+
 
 def _hkdf_expand_label(secret, label, length):
     full = b"tls13 " + label
@@ -186,6 +201,7 @@ def _hkdf_expand_label(secret, label, length):
         n += 1
     return out[:length]
 
+
 @functools.lru_cache(maxsize=4096)
 def quic_initial_keys(dcid, version=1):
     """(key, iv, header protection key) of the client's Initial packets."""
@@ -194,12 +210,14 @@ def quic_initial_keys(dcid, version=1):
     return tuple(_hkdf_expand_label(client, (prefix + part).encode(), size)
                  for part, size in (("key", 16), ("iv", 12), ("hp", 16)))
 
+
 def _varint(b, i):
     size = 1 << (b[i] >> 6)
     v = b[i] & 0x3F
     for k in range(1, size):
         v = v << 8 | b[i + k]
     return v, i + size
+
 
 def _quic_crypto():
     try:
@@ -210,7 +228,9 @@ def _quic_crypto():
         return None
     return InvalidTag, Cipher, algorithms, modes, AESGCM
 
+
 _CRYPTO = _quic_crypto()
+
 
 def quic_client_initials(dgram):
     """For each client Initial packet in a UDP datagram: (DCID, [(offset, data) of its CRYPTO frames])."""
@@ -243,6 +263,7 @@ def quic_client_initials(dgram):
                 yield dcid, frames
         i = end
 
+
 def _quic_decrypt(pkt, pn_offset, dcid, version):
     if _CRYPTO is None:
         return None
@@ -263,6 +284,7 @@ def _quic_decrypt(pkt, pn_offset, dcid, version):
     except InvalidTag:
         return None
     return _crypto_frames(plain)
+
 
 def _crypto_frames(b):
     out, i = [], 0
@@ -289,6 +311,7 @@ def _crypto_frames(b):
         pass
     return out
 
+
 def _client_hello_sni(chunks):
     """Server name from CRYPTO frames, once they hold a whole ClientHello; None while it is incomplete."""
     stream = bytearray()
@@ -303,7 +326,9 @@ def _client_hello_sni(chunks):
         return None
     return _tls_sni(b"\x16\x03\x01" + struct.pack(">H", size) + bytes(stream[:size])) or ""
 
+
 # ---------------------------------------------------------------- analyze ---
+
 
 class Analysis:
     def __init__(self):
@@ -314,6 +339,7 @@ class Analysis:
         self.seen = collections.defaultdict(dict)  # app -> ip -> name the app itself asked for (TLS or QUIC)
         self.dns = {}  # ip -> name, from every DNS answer in the capture (iOS resolves for apps in mDNSResponder)
         self._quic = {}  # (app, dcid) -> CRYPTO frames so far; None once the server name is read
+        self._tcp = {}  # (app, src, sport, dst, dport) -> [first seq, segments]; None once the hello is read
 
     def name_of(self, app, ip):
         return self.seen[app].get(ip) or self.dns.get(ip)
@@ -338,9 +364,11 @@ class Analysis:
         et = struct.unpack_from(">H", pkt, 12)[0]
         ip = pkt[14:]
         if et == 0x0800 and len(ip) > 20:
-            proto, dst, tp = ip[9], socket.inet_ntoa(ip[16:20]), ip[(ip[0] & 15) * 4:]
+            proto, tp = ip[9], ip[(ip[0] & 15) * 4:]
+            src, dst = socket.inet_ntoa(ip[12:16]), socket.inet_ntoa(ip[16:20])
         elif et == 0x86DD and len(ip) > 40:
-            proto, dst, tp = ip[6], socket.inet_ntop(socket.AF_INET6, ip[24:40]), ip[40:]
+            proto, tp = ip[6], ip[40:]
+            src, dst = socket.inet_ntop(socket.AF_INET6, ip[8:24]), socket.inet_ntop(socket.AF_INET6, ip[24:40])
         else:
             return
         if proto == 17 and len(tp) > 20:
@@ -360,62 +388,130 @@ class Analysis:
             elif dp == 443:
                 self.conns[app][("quic", dst, dp)] += 1
                 self._quic_initial(app, dst, pay)
-        elif proto == 6 and len(tp) > 20:
-            dp = struct.unpack_from(">H", tp, 2)[0]
+        elif proto == 6 and len(tp) >= 20:
+            sp, dp, seq = struct.unpack_from(">HHI", tp)
             pay = tp[(tp[12] >> 4) * 4:]
-            sni = _tls_sni(pay) if pay else None
-            if sni:
-                self.hosts[app]["tls " + sni] += 1
-                self.seen[app].setdefault(dst, sni)
+            flow = (app, src, sp, dst, dp)
+            if pay:
+                self._tls_segment(app, flow, seq, pay)
             elif tp[13] & 0x12 == 0x02:
                 self.conns[app][("tcp", dst, dp)] += 1
+                self._tcp[flow] = [(seq + 1) & 0xFFFFFFFF, []]  # the first data byte follows the SYN
+
+    def _tls_segment(self, app, flow, seq, pay):
+        """Collect a connection's first bytes until they hold the whole TLS ClientHello record."""
+        state = self._tcp.get(flow, ())
+        if state is None:
+            return
+        if not state:  # no SYN in the capture: start from this segment, if it opens a TLS handshake
+            if pay[0] != 0x16:
+                self._tcp[flow] = None
+                return
+            state = self._tcp[flow] = [seq, []]
+        state[1].append(((seq - state[0]) & 0xFFFFFFFF, pay))
+        stream = bytearray()
+        for off, data in sorted(state[1]):
+            if off > len(stream) or off > 65536:
+                break
+            stream[off:off + len(data)] = data
+        if stream and stream[0] != 0x16:  # the connection does not start with TLS
+            self._tcp[flow] = None
+            return
+        need = 5 + struct.unpack_from(">H", stream, 3)[0] if len(stream) >= 5 else None
+        if need is None or len(stream) < need:
+            if sum(len(d) for _, d in state[1]) > 65536:
+                self._tcp[flow] = None
+            return
+        self._tcp[flow] = None
+        sni = _tls_sni(bytes(stream[:need]))
+        if sni:
+            self.hosts[app]["tls " + sni] += 1
+            self.seen[app].setdefault(flow[3], sni)
+
+
+def read_packets(path):
+    """Yield (packet bytes, options bytes) of each Enhanced Packet Block, one block at a time."""
+    with open(path, "rb") as f:
+        order = "<"
+        while True:
+            head = f.read(8)
+            if len(head) < 8:
+                return
+            btype = struct.unpack_from("<I", head)[0]
+            if btype == 0x0A0D0D0A:  # Section Header: its byte-order magic sets the order of what follows
+                magic = f.read(4)
+                if len(magic) < 4:
+                    return
+                order = "<" if magic == b"\x4d\x3c\x2b\x1a" else ">"
+                blen = struct.unpack_from(order + "I", head, 4)[0]
+                rest = magic + f.read(blen - 12)
+            else:
+                btype, blen = struct.unpack(order + "II", head)
+                if blen < 12:
+                    return
+                rest = f.read(blen - 8)
+            if len(rest) < blen - 8:
+                return
+            if btype == 6:
+                cap = struct.unpack_from(order + "I", rest, 12)[0]
+                yield rest[20:20 + cap], rest[20 + ((cap + 3) & ~3):-4]
+
 
 def analyze(path, process=None):
-    with open(path, "rb") as f:
-        data = f.read()
     result = Analysis()
-    o = 0
-    while o + 12 <= len(data):
-        btype, blen = struct.unpack_from("<II", data, o)
-        if blen < 12 or o + blen > len(data):
-            break
-        if btype == 6:
-            cap = struct.unpack_from("<I", data, o + 20)[0]
-            pkt = data[o + 28:o + 28 + cap]
-            opts = data[o + 28 + ((cap + 3) & ~3):o + blen - 4]
-            m = re.search(rb"ProcName: ([^,\x00]*)", opts)
-            name = (m.group(1).decode(errors="replace") if m else "") or "(unattributed)"
-            # Every packet is read for DNS answers, since the app's own lookups are made by mDNSResponder;
-            # only the chosen app's packets are counted.
-            count = not process or name == process
-            if count:
-                result.total += 1
-                result.procs[name] += 1
-            result.inspect(pkt, name, count)
-        o += blen
+    for pkt, opts in read_packets(path):
+        m = re.search(rb"ProcName: ([^,\x00]*)", opts)
+        name = (m.group(1).decode(errors="replace") if m else "") or "(unattributed)"
+        # Every packet is read for DNS answers, since the app's own lookups are made by mDNSResponder;
+        # only the chosen app's packets are counted.
+        count = not process or name == process
+        if count:
+            result.total += 1
+            result.procs[name] += 1
+        result.inspect(pkt, name, count)
     return result
+
+
+def report(r, top=None):
+    """The analysis as plain data: apps by packet count, each with its hosts and connections."""
+    apps = []
+    for app, count in r.procs.most_common(top):
+        hosts = [{"kind": h.split(" ", 1)[0], "name": h.split(" ", 1)[1], "count": c}
+                 for h, c in r.hosts[app].most_common(top)]
+        conns = [{"kind": kind, "ip": ip, "port": port, "name": r.name_of(app, ip), "count": c}
+                 for (kind, ip, port), c in r.conns[app].most_common(top)]
+        apps.append({"name": app, "packets": count, "hosts": hosts, "connections": conns})
+    return {"packets": r.total, "apps": apps}
+
 
 def cmd_analyze(args):
     r = analyze(args.file, args.process)
     if _CRYPTO is None:
         print("[kta] the cryptography package is missing: QUIC server names are not read", file=sys.stderr)
-    print(f"{args.file}: {r.total} packets\n")
-    for app, count in r.procs.most_common(args.top):
-        print(f"{app}  ({count} packets)")
-        for h, c in r.hosts[app].most_common(args.top):
-            print(f"  {c:5d}  {h}")
-        for (kind, ip, port), c in r.conns[app].most_common(args.top):
-            addr = ip if kind == "quic" else f"{ip}:{port}"
-            name = r.name_of(app, ip)
-            print(f"  {c:5d}  {kind} {name} ({addr})" if name else f"  {c:5d}  {kind} {addr}")
+    if args.json:
+        data = {"file": args.file, **report(r, args.top)}
+        json.dump(data, sys.stdout, indent=2, ensure_ascii=False)
         print()
+        return
+    print(f"{args.file}: {r.total} packets\n")
+    for app in report(r, args.top or 12)["apps"]:
+        print(f"{app['name']}  ({app['packets']} packets)")
+        for h in app["hosts"]:
+            print(f"  {h['count']:5d}  {h['kind']} {h['name']}")
+        for c in app["connections"]:
+            addr = c["ip"] if c["kind"] == "quic" else f"{c['ip']}:{c['port']}"
+            label = f"{c['name']} ({addr})" if c["name"] else addr
+            print(f"  {c['count']:5d}  {c['kind']} {label}")
+        print()
+
 
 def cmd_run(args):
     out = args.out or datetime.now().strftime("kta-%Y%m%d-%H%M%S.pcapng")
     args.out = out
     cmd_capture(args)
-    args.file, args.top = out, 12
+    args.file = out
     cmd_analyze(args)
+
 
 def main():
     ap = argparse.ArgumentParser(prog="kta", description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
@@ -432,13 +528,16 @@ def main():
     a = sub.add_parser("analyze", help="list hosts and IPs per app")
     a.add_argument("file")
     a.add_argument("--process")
-    a.add_argument("--top", type=int, default=12)
+    a.add_argument("--top", type=int, help="apps and lines per app to show (text: 12, JSON: all)")
+    a.add_argument("--json", action="store_true", help="print the result as JSON on stdout")
     a.set_defaults(fn=cmd_analyze)
 
     r = sub.add_parser("run", help="capture, then analyze")
     r.add_argument("--out")
     r.add_argument("--process")
     r.add_argument("--seconds", type=int, default=60)
+    r.add_argument("--top", type=int, help="apps and lines per app to show (text: 12, JSON: all)")
+    r.add_argument("--json", action="store_true", help="print the result as JSON on stdout")
     r.set_defaults(fn=cmd_run)
 
     args = ap.parse_args()

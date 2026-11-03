@@ -1,6 +1,7 @@
 """Tests for kta. Run from the repository root: python3 -m unittest discover tests"""
 import contextlib
 import io
+import json
 import os
 import socket
 import struct
@@ -49,6 +50,17 @@ def ipv4_udp(src, dst, sport, dport, payload):
     ip = struct.pack(">BBHHHBBH4s4s", 0x45, 0, 20 + len(udp), 0, 0, 64, 17, 0,
                      socket.inet_aton(src), socket.inet_aton(dst))
     return b"\0" * 12 + b"\x08\x00" + ip + udp
+
+
+def ipv4_tcp(src, dst, sport, dport, seq, payload=b"", flags=0x18):
+    tcp = struct.pack(">HHIIBBHHH", sport, dport, seq & 0xFFFFFFFF, 0, 5 << 4, flags, 65535, 0, 0) + payload
+    ip = struct.pack(">BBHHHBBH4s4s", 0x45, 0, 20 + len(tcp), 0, 0, 64, 6, 0,
+                     socket.inet_aton(src), socket.inet_aton(dst))
+    return b"\0" * 12 + b"\x08\x00" + ip + tcp
+
+
+def tls_record(handshake):
+    return b"\x16\x03\x01" + struct.pack(">H", len(handshake)) + handshake
 
 
 def dns_response(name, addrs, cname=None):
@@ -165,11 +177,66 @@ class DnsTest(unittest.TestCase):
         self.assertEqual(set(kta.analyze(self.path).procs), {"mDNSResponder", "Pinterest"})
 
     def _render(self, r):
-        args = types.SimpleNamespace(file=self.path, process=None, top=12)
+        args = types.SimpleNamespace(file=self.path, process=None, top=None, json=False)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             kta.cmd_analyze(args)
         return buf.getvalue()
+
+
+class TcpTest(unittest.TestCase):
+    def test_client_hello_split_over_tcp_segments_out_of_order(self):
+        record = tls_record(client_hello("api.pinterest.com", padding=1800))
+        seq = 0xFFFFFF00  # the sequence number wraps inside the hello
+        segs = [(seq + i, record[i:i + 700]) for i in range(0, len(record), 700)]
+        path = os.path.join(tempfile.mkdtemp(), "t.pcapng")
+        frames = [ipv4_tcp(PHONE, "151.101.0.84", 50000, 443, seq - 1, flags=0x02)]
+        frames += [ipv4_tcp(PHONE, "151.101.0.84", 50000, 443, s, d) for s, d in (segs[1], segs[0], *segs[2:])]
+        frames.append(ipv4_tcp(PHONE, "151.101.0.84", 50000, 443, seq + len(record), b"\x17" * 50))
+        write_pcapng(path, [(f, "Pinterest") for f in frames])
+        r = kta.analyze(path)
+        self.assertEqual(dict(r.hosts["Pinterest"]), {"tls api.pinterest.com": 1})
+        self.assertEqual(r.name_of("Pinterest", "151.101.0.84"), "api.pinterest.com")
+        self.assertEqual(r.conns["Pinterest"][("tcp", "151.101.0.84", 443)], 1)
+
+    def test_non_tls_flow_is_dropped_at_once(self):
+        path = os.path.join(tempfile.mkdtemp(), "h.pcapng")
+        write_pcapng(path, [(ipv4_tcp(PHONE, "1.2.3.4", 50000, 80, 1, b"GET / HTTP/1.1\r\n"), "Safari")])
+        r = kta.analyze(path)
+        self.assertEqual(dict(r.hosts["Safari"]), {})
+        self.assertEqual(list(r._tcp.values()), [None])
+
+
+class OutputTest(unittest.TestCase):
+    def test_json(self):
+        path = os.path.join(tempfile.mkdtemp(), "j.pcapng")
+        write_pcapng(path, [
+            (ipv4_udp("192.168.1.1", PHONE, 53, 5000, dns_response("example.com", ["93.184.216.34"])),
+             "mDNSResponder"),
+            (ipv4_tcp(PHONE, "93.184.216.34", 50000, 443, 1, flags=0x02), "Safari"),
+        ])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            kta.cmd_analyze(types.SimpleNamespace(file=path, process=None, top=None, json=True))
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["packets"], 2)
+        safari = next(a for a in data["apps"] if a["name"] == "Safari")
+        self.assertEqual(safari["connections"], [
+            {"kind": "tcp", "ip": "93.184.216.34", "port": 443, "name": "example.com", "count": 1}])
+
+    def test_big_endian_section_and_truncated_tail(self):
+        path = os.path.join(tempfile.mkdtemp(), "be.pcapng")
+        frame = ipv4_tcp(PHONE, "1.2.3.4", 50000, 443, 1, flags=0x02)
+        comment = b"ProcName: Mail"
+        opts = struct.pack(">HH", 1, len(comment)) + _pad4(comment) + struct.pack(">HH", 0, 0)
+        body = struct.pack(">IIIII", 0, 0, 0, len(frame), len(frame)) + _pad4(frame) + opts
+        shb = struct.pack(">IHHq", 0x1A2B3C4D, 1, 0, -1)
+        with open(path, "wb") as f:
+            f.write(struct.pack(">II", 0x0A0D0D0A, 12 + len(shb)) + shb + struct.pack(">I", 12 + len(shb)))
+            f.write(struct.pack(">II", 6, 12 + len(body)) + body + struct.pack(">I", 12 + len(body)))
+            f.write(struct.pack(">II", 6, 400) + b"\0" * 30)  # capture cut off mid-block
+        r = kta.analyze(path)
+        self.assertEqual(dict(r.procs), {"Mail": 1})
 
 
 class CaptureTimerTest(unittest.TestCase):
