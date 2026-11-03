@@ -1,1 +1,2 @@
 pymobiledevice3>=11.44
+cryptography>=42
