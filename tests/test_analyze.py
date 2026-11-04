@@ -162,3 +162,49 @@ def test_incompatible_pymobiledevice3_exits_with_message():
     with pytest.raises(SystemExit) as e:
         kta._check_pcapd(stub)
     assert "not compatible" in str(e.value) and "parse_device_packet" in str(e.value)
+
+
+def _ipv6(src, dst, next_header, payload):
+    """next_header names what follows the fixed header: TCP/UDP, or the first extension header in payload."""
+    hdr = struct.pack(">IHBB16s16s", 6 << 28, len(payload), next_header, 64,
+                      socket.inet_pton(socket.AF_INET6, src), socket.inet_pton(socket.AF_INET6, dst))
+    return b"\0" * 12 + b"\x86\xdd" + hdr + payload
+
+
+PHONE6 = "2001:db8::20"
+SERVER6 = "2606:4700::1"
+
+
+def test_ipv6_extension_headers_are_followed(tmp_path):
+    hop_by_hop = bytes([6, 0]) + b"\0" * 6                          # next: TCP, 8 bytes long
+    first_fragment = bytes([6, 0]) + struct.pack(">HI", 0, 1)        # offset 0: TCP header inside
+    later_fragment = bytes([6, 0]) + struct.pack(">HI", 8 << 3, 1)   # offset 64: only data
+    path = _write(tmp_path, [
+        (_ipv6(PHONE6, SERVER6, 0, hop_by_hop + _tcp(50000, 443, 0x18, _client_hello("hop.example.com"))), "App"),
+        (_ipv6(PHONE6, SERVER6, 44, first_fragment + _tcp(50001, 443, 0x18, _client_hello("frag.example.com"))), "App"),
+        (_ipv6(PHONE6, SERVER6, 44, later_fragment + b"\x16" * 60), "App"),
+    ])
+    _, _, hosts, ips, _ = kta.analyze(path)
+    assert hosts["App"] == {"tls hop.example.com": 1, "tls frag.example.com": 1}
+    assert not ips["App"]
+
+
+def test_local_ipv6_is_skipped(tmp_path):
+    path = _write(tmp_path, [
+        (_ipv6(PHONE6, dst, 6, _tcp(50000, 443, 0x02)), "App")
+        for dst in ("fc00::1", "fd12::1", "fe80::1", "febf::1", SERVER6)
+    ])
+    _, _, _, ips, _ = kta.analyze(path)
+    assert list(ips["App"]) == [("tcp", SERVER6, ":443")]
+
+
+def test_dns_over_tcp(tmp_path):
+    query = _dns_query("tcp.example.com")
+    reply = _dns_reply("tcp.example.com", "edge.example.net", "203.0.113.9")
+    path = _write(tmp_path, [
+        (_ipv4(PHONE, RESOLVER, 6, _tcp(50000, 53, 0x18, struct.pack(">H", len(query)) + query)), "App"),
+        (_ipv4(RESOLVER, PHONE, 6, _tcp(53, 50000, 0x18, struct.pack(">H", len(reply)) + reply)), "App"),
+    ])
+    _, _, hosts, _, names = kta.analyze(path)
+    assert hosts["App"] == {"dns tcp.example.com": 1}
+    assert names == {"203.0.113.9": "tcp.example.com"}

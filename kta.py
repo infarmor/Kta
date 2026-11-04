@@ -8,6 +8,7 @@
 import argparse
 import collections
 import contextlib
+import ipaddress
 import json
 import os
 import re
@@ -228,6 +229,11 @@ def analyze(path, process=None):
     return total, procs, hosts, ips, names
 
 
+# IPv6 extension headers that can sit between the fixed header and TCP/UDP: hop-by-hop, routing, fragment,
+# authentication, destination options.
+_IPV6_EXTENSIONS = {0, 43, 44, 51, 60}
+
+
 def _ip_layer(pkt):
     """(protocol, destination, transport bytes) of an Ethernet frame, or None."""
     if len(pkt) < 34:
@@ -237,17 +243,58 @@ def _ip_layer(pkt):
     if et == 0x0800 and len(ip) > 20:
         return ip[9], socket.inet_ntoa(ip[16:20]), ip[(ip[0] & 15) * 4:]
     if et == 0x86DD and len(ip) > 40:
-        return ip[6], socket.inet_ntop(socket.AF_INET6, ip[24:40]), ip[40:]
+        proto, tp = ip[6], ip[40:]
+        for _ in range(8):
+            if proto not in _IPV6_EXTENSIONS:
+                break
+            if len(tp) < 8:
+                return None
+            if proto == 44:
+                # Only the first fragment carries the TCP/UDP header.
+                if struct.unpack_from(">H", tp, 2)[0] & 0xFFF8:
+                    return None
+                size = 8
+            elif proto == 51:
+                size = (tp[1] + 2) * 4
+            else:
+                size = (tp[1] + 1) * 8
+            proto, tp = tp[0], tp[size:]
+        return proto, socket.inet_ntop(socket.AF_INET6, ip[24:40]), tp
     return None
+
+
+_LOCAL_V6 = (ipaddress.ip_network("fc00::/7"), ipaddress.ip_network("fe80::/10"))
+
+
+def _is_local(dst):
+    """Unique-local and link-local IPv6: the Mac–iPhone link itself and other on-device traffic."""
+    if ":" not in dst:
+        return False
+    a = ipaddress.ip_address(dst)
+    return any(a in net for net in _LOCAL_V6)
+
+
+def _tcp_dns(pay):
+    """The DNS message in a TCP segment (it starts with a 2-byte length), when the whole message is there."""
+    if len(pay) < 14:
+        return None
+    n = struct.unpack_from(">H", pay, 0)[0]
+    return pay[2:2 + n] if 12 < n <= len(pay) - 2 else None
 
 
 def _dns_reply(pkt):
     layer = _ip_layer(pkt)
-    if not layer or layer[0] != 17 or len(layer[2]) <= 20:
+    if not layer or len(layer[2]) <= 20:
         return []
-    tp = layer[2]
-    pay = tp[8:]
-    if struct.unpack_from(">H", tp, 0)[0] not in (53, 5353) or len(pay) <= 12 or not pay[2] & 0x80:
+    proto, _, tp = layer
+    sp = struct.unpack_from(">H", tp, 0)[0]
+    if proto == 17 and sp in (53, 5353):
+        pay = tp[8:]
+    elif proto == 6 and sp == 53:
+        pay = _tcp_dns(tp[(tp[12] >> 4) * 4:])
+    else:
+        return []
+    if not pay or len(pay) <= 12 or not pay[2] & 0x80:
         return []
     return _dns_answers(pay)
 
@@ -257,7 +304,7 @@ def _inspect(pkt, name, hosts, ips):
     if not layer:
         return
     proto, dst, tp = layer
-    if dst.startswith(("fd", "fe80")):
+    if _is_local(dst):
         return
     if proto == 17 and len(tp) > 20:
         dp = struct.unpack_from(">H", tp, 2)[0]
@@ -271,6 +318,12 @@ def _inspect(pkt, name, hosts, ips):
     elif proto == 6 and len(tp) > 20:
         dp = struct.unpack_from(">H", tp, 2)[0]
         pay = tp[(tp[12] >> 4) * 4:]
+        query = _tcp_dns(pay) if dp == 53 else None
+        if query and not query[2] & 0x80:
+            n = _dns_name(query, 12)[0]
+            if n:
+                hosts[name]["dns " + n] += 1
+            return
         sni = _tls_sni(pay) if pay else None
         if sni:
             hosts[name]["tls " + sni] += 1
