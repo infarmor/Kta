@@ -267,3 +267,27 @@ def test_live_mode_prints_from_the_patched_watch(monkeypatch):
 
     assert len(asyncio.run(drain())) == 2
     assert out.getvalue() == "App  tls live.example.com\n"
+
+
+def test_capture_that_ends_early_cancels_its_timer(monkeypatch, tmp_path):
+    """--seconds must not leave a timer behind that later sends SIGINT into the analysis."""
+    import argparse
+    import threading
+    import types
+    main = types.ModuleType("pymobiledevice3.__main__")
+    main.main = lambda: None   # the capture ends at once, as when the phone is unplugged
+    monkeypatch.setitem(sys.modules, "pymobiledevice3", types.ModuleType("pymobiledevice3"))
+    monkeypatch.setitem(sys.modules, "pymobiledevice3.__main__", main)
+    monkeypatch.setattr(kta, "_patch_pcapd", lambda: None)
+    started = []
+    real_timer = threading.Timer
+
+    def recording_timer(*args, **kwargs):
+        t = real_timer(*args, **kwargs)
+        started.append(t)
+        return t
+    monkeypatch.setattr(kta.threading, "Timer", recording_timer)
+    kta.cmd_capture(argparse.Namespace(out=str(tmp_path / "x.pcapng"), process=None, seconds=30, live=False))
+    assert len(started) == 1
+    started[0].join(1)
+    assert not started[0].is_alive() and started[0].daemon

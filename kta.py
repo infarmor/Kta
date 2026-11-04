@@ -120,8 +120,13 @@ def cmd_capture(args):
     if getattr(args, "live", False):
         # The real stdout: pymobiledevice3's own output is sent to /dev/null below.
         _on_packet = _live_printer(Analysis(args.process), sys.stdout)
+    # Stops the capture the way Ctrl+C would. Cancelled when the capture ends sooner (phone unplugged, Ctrl+C,
+    # an error), so a late SIGINT can neither keep kta waiting nor break into the analysis that follows.
+    timer = None
     if args.seconds:
-        threading.Timer(args.seconds, lambda: os.kill(os.getpid(), signal.SIGINT)).start()
+        timer = threading.Timer(args.seconds, lambda: os.kill(os.getpid(), signal.SIGINT))
+        timer.daemon = True
+        timer.start()
     print(f"[kta] capturing to {out}" + (f" for {args.seconds}s" if args.seconds else " (Ctrl+C to stop)"),
           file=sys.stderr)
     sys.argv = argv
@@ -133,6 +138,8 @@ def cmd_capture(args):
             raise
     finally:
         _on_packet = None
+        if timer is not None:
+            timer.cancel()
     size = os.path.getsize(out) if os.path.exists(out) else 0
     print(f"[kta] saved {out} ({size / 1e6:.1f} MB)", file=sys.stderr)
     return out
