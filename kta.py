@@ -98,13 +98,51 @@ def cmd_capture(args):
 # ---------------------------------------------------------------- analyze ---
 
 def _dns_name(m, i):
-    out = []
-    for _ in range(20):
-        if i >= len(m) or m[i] == 0 or m[i] & 0xC0:
+    """Read a DNS name at offset i, following compression pointers. Returns (name, offset after it)."""
+    out, end, jumps = [], None, 0
+    while i < len(m) and len(out) < 64:
+        n = m[i]
+        if n == 0:
+            i += 1
             break
-        out.append(m[i + 1:i + 1 + m[i]].decode("ascii", "replace"))
-        i += m[i] + 1
-    return ".".join(out)
+        if n & 0xC0 == 0xC0:
+            if i + 1 >= len(m) or jumps > 10:
+                break
+            if end is None:
+                end = i + 2
+            i = ((n & 0x3F) << 8) | m[i + 1]
+            jumps += 1
+            continue
+        if n & 0xC0:
+            break
+        out.append(m[i + 1:i + 1 + n].decode("ascii", "replace"))
+        i += n + 1
+    return ".".join(out), (end if end is not None else i)
+
+
+def _dns_answers(m):
+    """IP addresses in a DNS response, each paired with the name that was asked for."""
+    out = []
+    try:
+        qd, an = struct.unpack_from(">HH", m, 4)
+        i, asked = 12, ""
+        for _ in range(qd):
+            name, i = _dns_name(m, i)
+            asked = asked or name
+            i += 4
+        for _ in range(an):
+            _, i = _dns_name(m, i)
+            rtype, _cls, _ttl, rdlen = struct.unpack_from(">HHIH", m, i)
+            i += 10
+            rdata = m[i:i + rdlen]
+            if rtype == 1 and len(rdata) == 4:
+                out.append((socket.inet_ntoa(rdata), asked))
+            elif rtype == 28 and len(rdata) == 16:
+                out.append((socket.inet_ntop(socket.AF_INET6, rdata), asked))
+            i += rdlen
+    except (struct.error, IndexError, ValueError, OSError):
+        pass
+    return [(ip, name) for ip, name in out if name]
 
 
 def _tls_sni(p):
@@ -128,55 +166,87 @@ def _tls_sni(p):
     return None
 
 
+def _blocks(f):
+    """Yield (type, body) for each pcapng block, reading the file a block at a time."""
+    while True:
+        head = f.read(8)
+        if len(head) < 8:
+            return
+        btype, blen = struct.unpack("<II", head)
+        if blen < 12:
+            return
+        body = f.read(blen - 8)
+        if len(body) < blen - 8:
+            return
+        yield btype, body[:-4]
+
+
 def analyze(path, process=None):
-    data = open(path, "rb").read()
     procs = collections.Counter()
     hosts = collections.defaultdict(collections.Counter)
     ips = collections.defaultdict(collections.Counter)
+    names = {}
     total = 0
-    o = 0
-    while o + 12 <= len(data):
-        btype, blen = struct.unpack_from("<II", data, o)
-        if blen < 12 or o + blen > len(data):
-            break
-        if btype == 6:
-            cap = struct.unpack_from("<I", data, o + 20)[0]
-            pkt = data[o + 28:o + 28 + cap]
-            opts = data[o + 28 + ((cap + 3) & ~3):o + blen - 4]
+    with open(path, "rb") as f:
+        for btype, body in _blocks(f):
+            if btype != 6 or len(body) < 20:
+                continue
+            cap = struct.unpack_from("<I", body, 12)[0]
+            pkt = body[20:20 + cap]
+            opts = body[20 + ((cap + 3) & ~3):]
             m = re.search(rb"ProcName: ([^,]*),", opts)
             name = (m.group(1).decode(errors="replace") if m else "") or "(unattributed)"
+            # A DNS answer names its IPs for every app, whichever process received it.
+            for ip, host in _dns_reply(pkt):
+                names[ip] = host
             if process and name != process:
-                o += blen
                 continue
             total += 1
             procs[name] += 1
             _inspect(pkt, name, hosts, ips)
-        o += blen
-    return total, procs, hosts, ips
+    return total, procs, hosts, ips, names
 
 
-def _inspect(pkt, name, hosts, ips):
+def _ip_layer(pkt):
+    """(protocol, destination, transport bytes) of an Ethernet frame, or None."""
     if len(pkt) < 34:
-        return
+        return None
     et = struct.unpack_from(">H", pkt, 12)[0]
     ip = pkt[14:]
     if et == 0x0800 and len(ip) > 20:
-        proto, dst, tp = ip[9], socket.inet_ntoa(ip[16:20]), ip[(ip[0] & 15) * 4:]
-    elif et == 0x86DD and len(ip) > 40:
-        proto, dst, tp = ip[6], socket.inet_ntop(socket.AF_INET6, ip[24:40]), ip[40:]
-    else:
+        return ip[9], socket.inet_ntoa(ip[16:20]), ip[(ip[0] & 15) * 4:]
+    if et == 0x86DD and len(ip) > 40:
+        return ip[6], socket.inet_ntop(socket.AF_INET6, ip[24:40]), ip[40:]
+    return None
+
+
+def _dns_reply(pkt):
+    layer = _ip_layer(pkt)
+    if not layer or layer[0] != 17 or len(layer[2]) <= 20:
+        return []
+    tp = layer[2]
+    pay = tp[8:]
+    if struct.unpack_from(">H", tp, 0)[0] not in (53, 5353) or len(pay) <= 12 or not pay[2] & 0x80:
+        return []
+    return _dns_answers(pay)
+
+
+def _inspect(pkt, name, hosts, ips):
+    layer = _ip_layer(pkt)
+    if not layer:
         return
+    proto, dst, tp = layer
     if dst.startswith(("fd", "fe80")):
         return
     if proto == 17 and len(tp) > 20:
         dp = struct.unpack_from(">H", tp, 2)[0]
         pay = tp[8:]
         if dp in (53, 5353) and len(pay) > 12 and not pay[2] & 0x80:
-            n = _dns_name(pay, 12)
+            n = _dns_name(pay, 12)[0]
             if n:
                 hosts[name]["dns " + n] += 1
         elif dp == 443:
-            ips[name]["quic " + dst] += 1
+            ips[name][("quic", dst, "")] += 1
     elif proto == 6 and len(tp) > 20:
         dp = struct.unpack_from(">H", tp, 2)[0]
         pay = tp[(tp[12] >> 4) * 4:]
@@ -184,18 +254,24 @@ def _inspect(pkt, name, hosts, ips):
         if sni:
             hosts[name]["tls " + sni] += 1
         elif tp[13] & 0x12 == 0x02:
-            ips[name][f"tcp {dst}:{dp}"] += 1
+            ips[name][("tcp", dst, f":{dp}")] += 1
+
+
+def _label(key, names):
+    kind, ip, port = key
+    host = names.get(ip)
+    return f"{kind} {ip}{port}" + (f"  ({host})" if host else "")
 
 
 def cmd_analyze(args):
-    total, procs, hosts, ips = analyze(args.file, args.process)
+    total, procs, hosts, ips, names = analyze(args.file, args.process)
     print(f"{args.file}: {total} packets\n")
     for name, count in procs.most_common(args.top):
         print(f"{name}  ({count} packets)")
         for h, c in hosts[name].most_common(args.top):
             print(f"  {c:5d}  {h}")
-        for h, c in ips[name].most_common(5):
-            print(f"  {c:5d}  {h}")
+        for key, c in ips[name].most_common(5):
+            print(f"  {c:5d}  {_label(key, names)}")
         print()
 
 

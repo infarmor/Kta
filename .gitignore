@@ -2,3 +2,4 @@
 __pycache__/
 *.pcap
 *.pcapng
+.pytest_cache/
