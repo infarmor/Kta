@@ -7,9 +7,11 @@ on:
 
 jobs:
   analyze:
-    # The analyzer is plain Python and needs no iPhone, so it runs on Linux.
-    runs-on: ubuntu-latest
+    # The analyzer is plain Python and needs no iPhone, so it runs on Linux. 3.9 is the python3 Apple ships
+    # with the Command Line Tools; setup-python has no 3.9 build for Ubuntu 26.04, hence the pinned runner.
+    runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         python: ["3.9", "3.13"]
     steps:
