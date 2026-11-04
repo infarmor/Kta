@@ -53,6 +53,18 @@ cd Kta
 ./kta analyze phone.pcapng --process Pinterest
 ```
 
+`--live` (для `capture` и `run`) печатает по ходу записи каждый новый для приложения хост:
+
+```bash
+./kta run --live
+```
+
+```
+Pinterest  dns api.pinterest.com
+Pinterest  tls api.pinterest.com
+Pinterest  quic 2.22.237.73  (i.pinimg.com)
+```
+
 `--json` (для `analyze` и `run`) печатает полный результат в JSON, без ограничения `--top`:
 
 ```bash

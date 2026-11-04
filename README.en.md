@@ -55,6 +55,18 @@ Separate commands:
 ./kta analyze phone.pcapng --process Pinterest
 ```
 
+`--live` (for `capture` and `run`) prints each host an app reaches for the first time, while recording:
+
+```bash
+./kta run --live
+```
+
+```
+Pinterest  dns api.pinterest.com
+Pinterest  tls api.pinterest.com
+Pinterest  quic 2.22.237.73  (i.pinimg.com)
+```
+
 `--json` (for `analyze` and `run`) prints the full result as JSON, not cut to `--top`:
 
 ```bash

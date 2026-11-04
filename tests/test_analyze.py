@@ -208,3 +208,62 @@ def test_dns_over_tcp(tmp_path):
     _, _, hosts, _, names = kta.analyze(path)
     assert hosts["App"] == {"dns tcp.example.com": 1}
     assert names == {"203.0.113.9": "tcp.example.com"}
+
+
+def test_analysis_reports_each_host_once_per_app():
+    a = kta.Analysis()
+    hello = _ipv4(PHONE, "93.184.216.34", 6, _tcp(50001, 443, 0x18, _client_hello("api.example.com")))
+    syn = _ipv4(PHONE, "198.51.100.7", 6, _tcp(50002, 443, 0x02))
+    seen = [a.add("App", hello), a.add("App", hello), a.add("Other", hello), a.add("App", syn), a.add("", syn)]
+    assert seen == [
+        ("App", "tls api.example.com"),
+        None,
+        ("Other", "tls api.example.com"),
+        ("App", "tcp 198.51.100.7:443"),
+        ("(unattributed)", "tcp 198.51.100.7:443"),
+    ]
+    assert a.total == 5 and a.procs["App"] == 3
+
+
+def test_live_mode_prints_from_the_patched_watch(monkeypatch):
+    """Runs kta's replacement for PcapdService.watch against a stand-in pcapd module."""
+    import asyncio
+    import io
+    import types
+
+    class Packet:
+        def __init__(self, comm, frame):
+            self.pid, self.comm, self.interface_name = 1, comm, "en0"
+            self.interface_type = self.protocol_family = 0
+            self.frame_pre_length, self.data = 14, frame
+
+    frames = [_ipv4(PHONE, "93.184.216.34", 6, _tcp(50001, 443, 0x18, _client_hello("live.example.com")))] * 2
+    pcapd = types.ModuleType("pymobiledevice3.services.pcapd")
+    pcapd.PcapdService = type("PcapdService", (), {"watch": None})
+    pcapd.parse_device_packet = lambda raw: Packet("App", frames.pop())
+    pcapd.INTERFACE_NAMES = pcapd.CrossPlatformAddressFamily = lambda v: v
+    pcapd.ETHERNET_HEADER = b"\0" * 14
+    services = types.ModuleType("pymobiledevice3.services")
+    services.pcapd = pcapd
+    for name, module in [("pymobiledevice3", types.ModuleType("pymobiledevice3")),
+                         ("pymobiledevice3.services", services), ("pymobiledevice3.services.pcapd", pcapd)]:
+        monkeypatch.setitem(sys.modules, name, module)
+
+    class Service:
+        def __init__(self):
+            self.raw = [b"\0" * 8, b"x", b"\0" * 8]   # the 1-byte frame is the one newer iOS sends
+
+        async def recv_plist(self):
+            return self.raw.pop(0) if self.raw else None
+
+    out = io.StringIO()
+    kta._patch_pcapd()
+    monkeypatch.setattr(kta, "_on_packet", kta._live_printer(kta.Analysis(), out))
+    service = pcapd.PcapdService()
+    service.service = Service()
+
+    async def drain():
+        return [p async for p in service.watch()]
+
+    assert len(asyncio.run(drain())) == 2
+    assert out.getvalue() == "App  tls live.example.com\n"
