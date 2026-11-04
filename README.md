@@ -51,6 +51,14 @@ cd Kta
 ./kta analyze phone.pcapng --process Pinterest
 ```
 
+`--json` (для `analyze` и `run`) печатает полный результат в JSON, без ограничения `--top`:
+
+```bash
+./kta analyze phone.pcapng --json > phone.json
+```
+
+Для каждого приложения: `hosts` — имена из DNS и TLS, `connections` — IP-адреса с портом и доменом из DNS-ответа (`name`, если он известен).
+
 ASCII-баннер печатается в stderr. Отключить: `./kta -s run` (флаг `-s` ставится перед командой).
 
 Пример вывода:

@@ -136,3 +136,29 @@ def test_malformed_dns_does_not_raise():
     assert kta._dns_answers(b"\0\x01\x81\x80\0\x01\0\x05" + b"\xc0") == []
     # A pointer loop must end.
     assert kta._dns_name(b"\xc0\x00", 0)[0] == ""
+
+
+def test_report_is_json_ready(tmp_path):
+    import json
+    path = _write(tmp_path, [
+        (_ipv4(RESOLVER, PHONE, 17, _udp(53, 50000, _dns_reply("img.example.com", "cdn.example.net", "2.22.237.73"))),
+         "mDNSResponder"),
+        (_ipv4(PHONE, "2.22.237.73", 6, _tcp(50004, 443, 0x02)), "App"),
+        (_ipv4(PHONE, "93.184.216.34", 6, _tcp(50001, 443, 0x18, _client_hello("api.example.com"))), "App"),
+    ])
+    data = json.loads(json.dumps(kta.report(path, *kta.analyze(path))))
+    app = next(a for a in data["apps"] if a["name"] == "App")
+    assert data["packets"] == 3 and app["packets"] == 2
+    assert app["hosts"] == [{"kind": "tls", "name": "api.example.com", "count": 1}]
+    assert app["connections"] == [
+        {"kind": "tcp", "ip": "2.22.237.73", "port": 443, "name": "img.example.com", "count": 1},
+    ]
+
+
+def test_incompatible_pymobiledevice3_exits_with_message():
+    import types
+    import pytest
+    stub = types.SimpleNamespace(PcapdService=type("PcapdService", (), {}))
+    with pytest.raises(SystemExit) as e:
+        kta._check_pcapd(stub)
+    assert "not compatible" in str(e.value) and "parse_device_packet" in str(e.value)

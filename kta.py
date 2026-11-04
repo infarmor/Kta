@@ -2,12 +2,13 @@
 """Kta: capture an iPhone's traffic on a Mac over USB and see which app talks to which host.
 
   kta capture --out iphone.pcapng [--process Name] [--seconds N]
-  kta analyze iphone.pcapng [--process Name] [--top N]
-  kta run [--seconds N] [--process Name]      capture, then analyze
+  kta analyze iphone.pcapng [--process Name] [--top N] [--json]
+  kta run [--seconds N] [--process Name] [--json]      capture, then analyze
 """
 import argparse
 import collections
 import contextlib
+import json
 import os
 import re
 import signal
@@ -35,11 +36,31 @@ def print_banner():
 
 # ---------------------------------------------------------------- capture ---
 
+# What _patch_pcapd uses from pymobiledevice3's internals. A release that renames any of them must stop the
+# capture with a clear message instead of failing halfway through.
+_PCAPD_NAMES = ("PcapdService", "parse_device_packet", "INTERFACE_NAMES", "CrossPlatformAddressFamily",
+                "ETHERNET_HEADER")
+
+
+def _check_pcapd(pcapd):
+    missing = [n for n in _PCAPD_NAMES if not hasattr(pcapd, n)]
+    if missing or not hasattr(getattr(pcapd, "PcapdService", None), "watch"):
+        try:
+            from importlib.metadata import version
+            installed = version("pymobiledevice3")
+        except Exception:
+            installed = "unknown"
+        sys.exit(f"pymobiledevice3 {installed} is not compatible with kta (missing: "
+                 f"{', '.join(missing) or 'PcapdService.watch'}). Run ./install.sh to install a supported version.")
+
+
 def _patch_pcapd():
     """Skip malformed service packets (newer iOS sends 1-byte frames that crash pymobiledevice3)."""
     from typing import cast
 
     from pymobiledevice3.services import pcapd
+
+    _check_pcapd(pcapd)
 
     async def watch(self, packets_count=-1, process=None, interface_name=None):
         index = 0
@@ -263,8 +284,28 @@ def _label(key, names):
     return f"{kind} {ip}{port}" + (f"  ({host})" if host else "")
 
 
+def report(path, total, procs, hosts, ips, names):
+    """Everything analyze found, as plain data for --json. Nothing is cut to --top."""
+    apps = []
+    for name, count in procs.most_common():
+        apps.append({
+            "name": name,
+            "packets": count,
+            "hosts": [{"kind": h.split(" ", 1)[0], "name": h.split(" ", 1)[1], "count": c}
+                      for h, c in hosts[name].most_common()],
+            "connections": [{"kind": kind, "ip": ip, "port": int(port[1:]) if port else None,
+                             "name": names.get(ip), "count": c}
+                            for (kind, ip, port), c in ips[name].most_common()],
+        })
+    return {"file": path, "packets": total, "apps": apps}
+
+
 def cmd_analyze(args):
     total, procs, hosts, ips, names = analyze(args.file, args.process)
+    if getattr(args, "json", False):
+        json.dump(report(args.file, total, procs, hosts, ips, names), sys.stdout, indent=2, ensure_ascii=False)
+        print()
+        return
     print(f"{args.file}: {total} packets\n")
     for name, count in procs.most_common(args.top):
         print(f"{name}  ({count} packets)")
@@ -299,12 +340,14 @@ def main():
     a.add_argument("file")
     a.add_argument("--process")
     a.add_argument("--top", type=int, default=12)
+    a.add_argument("--json", action="store_true", help="print the full result as JSON")
     a.set_defaults(fn=cmd_analyze)
 
     r = sub.add_parser("run", help="capture, then analyze")
     r.add_argument("--out")
     r.add_argument("--process")
     r.add_argument("--seconds", type=int, default=60)
+    r.add_argument("--json", action="store_true", help="print the full result as JSON")
     r.set_defaults(fn=cmd_run)
 
     args = ap.parse_args()
